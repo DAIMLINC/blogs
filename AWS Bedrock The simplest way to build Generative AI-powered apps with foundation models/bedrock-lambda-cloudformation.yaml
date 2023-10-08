@@ -1,0 +1,246 @@
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - lambda:PublishLayerVersion
+                - lambda:DeleteLayerVersion
+                - bedrock:*
+                Effect: Allow
+                Resource:
+                  - "*"
+          PolicyName: lambda
+
+  PipInstallLayerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Create layers based on pip install
+      FunctionName: !Sub "PipInstallLayer-${AWS::StackName}"
+      Handler: index.handler
+      MemorySize: 1024
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import zipfile
+          import typing as t
+          import shutil
+
+          import boto3
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          client  = boto3.client("lambda")
+
+          def create_lambda_layer(properties):
+              layername = properties["LayerName"]
+              packages = properties["Packages"]
+              # Create a temporary directory for Python packages
+              temp_dir = pathlib.Path(tempfile.TemporaryDirectory().name) / "python"
+              try:
+              # Install packages to the temporary directory
+                  subprocess.check_call([
+                  sys.executable, "-m", "pip", "install", *packages, "-t", temp_dir])
+              except subprocess.CalledProcessError:
+                  raise Exception("Error while installing %s" % str(packages))
+              zipfilename = pathlib.Path(tempfile.NamedTemporaryFile(suffix=".zip").name)
+              shutil.make_archive(
+                  zipfilename.with_suffix(""), format="zip", root_dir=temp_dir.parent)
+
+              # Publish the Lambda Layer
+              layer = client.publish_layer_version(
+                  LayerName=layername,
+                  Description="Necessary packages Installation",
+                  Content={"ZipFile": zipfilename.read_bytes()},
+                  CompatibleRuntimes=["python%d.%d" % sys.version_info[:2]],
+              )
+
+              logger.info("Created layer %s", layer["LayerVersionArn"])
+              return layer["LayerVersionArn"], {}
+
+
+          def delete_lambda_layer(physical_id):
+              match = re.fullmatch(
+                  r"arn:aws:lambda:(?P<region>[^:]+):(?P<account>\d+):layer:"
+                  r"(?P<layername>[^:]+):(?P<version_number>\d+)", physical_id)
+              if not match:
+                  logger.warning("Cannot parse physical id %s, not deleting", physical_id)
+                  return
+
+              layer_name = match.group("layername")
+              version_number = int(match.group("version_number"))
+
+              logger.info("Now deleting layer %s:%d", layer_name, version_number)
+              client.delete_layer_version(
+                  LayerName=layer_name,
+                  VersionNumber=version_number)
+
+              logger.info("Done")
+
+
+          def handler(event, context):
+              logger.info('{"event": %s}', json.dumps(event))
+              try:
+                  if event["RequestType"].upper() in ("CREATE", "UPDATE"):
+                      physical_id, attributes = create_lambda_layer(event["ResourceProperties"])
+                      cfnresponse.send(
+                          event=event,
+                          context=context,
+                          responseData=attributes,
+                          responseStatus=cfnresponse.SUCCESS,
+                          physicalResourceId=physical_id,
+                      )
+                  else:
+                      assert event["RequestType"].upper() == "DELETE"
+                      delete_lambda_layer(event["PhysicalResourceId"])
+                      cfnresponse.send(
+                          event=event,
+                          context=context,
+                          responseData={},
+                          responseStatus=cfnresponse.SUCCESS,
+                          physicalResourceId=event["PhysicalResourceId"],
+                      )
+              except Exception as e:
+                  logger.exception("Internal Error")
+                  cfnresponse.send(
+                      event=event,
+                      context=context,
+                      responseData=None,
+                      responseStatus=cfnresponse.FAILED,
+                      reason=str(e))
+
+
+  Boto3Layer:
+    Type: Custom::PipLayer
+    Properties:
+      ServiceToken: !GetAtt PipInstallLayerLambda.Arn
+      Region: !Ref AWS::Region
+      LayerName: Boto3Layer
+      Packages:
+        - boto3
+
+  BedrockAppLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Create Bedrock application integartion with lambda
+      FunctionName: BedrockAppLambda
+      Handler: index.handler
+      MemorySize: 1024
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 600
+      Layers: [!Ref Boto3Layer]
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+
+          def get_randomness_and_diversity_config(inference_config):
+              config = inference_config.get("randomness_and_diversity", {})
+              temperature = config.get("temperature", 0.7)
+              top_p = config.get("topP", 1)
+              return temperature, top_p
+
+
+          def get_length_config(inference_config):
+              config = inference_config.get("length", {})
+              max_tokens = config.get("max_completion_length", 200)
+              stop_sequences = config.get("stop_sequences", [])
+              return max_tokens, stop_sequences
+
+
+          def get_penalty_config(inference_config):
+              config = inference_config.get("repetitions", {})
+
+              special_tokens_map = {
+                  "whitespace": "applyToWhitespaces",
+                  "numbers": "applyToNumbers",
+                  "emojis": "applyToEmojis",
+                  "punctuations": "applyToPunctuations",
+                  "stopwords": "applyToStopwords"
+              }
+
+              special_tokens = config.get("penalize_special_tokens", [])
+
+              special_tokens_dict = {special_tokens_map.get(token): True for token in special_tokens}
+
+              def create_penalty(scale):
+                  return {**{"scale": scale}, **special_tokens_dict}
+
+              count_penalty = create_penalty(config.get("count_penalty", 0))
+              presence_penalty = create_penalty(config.get("count_penalty", 0))
+              frequency_penalty = create_penalty(config.get("frequency_penalty", 0))
+
+              return count_penalty, presence_penalty, frequency_penalty
+
+
+          def handler(event, context):
+              bedrock = boto3.client('bedrock-runtime')
+
+              model_id = "ai21.j2-ultra-v1"
+              content_type = "application/json"
+              accept = "*/*"
+
+              inference_config = event.get("inference_config", {})
+
+              temperature, top_p = get_randomness_and_diversity_config(inference_config)
+              max_tokens, stop_sequences = get_length_config(inference_config)
+              count_penalty, presence_penalty, frequency_penalty = get_penalty_config(inference_config)
+
+              body = {
+                  "prompt": event.get("prompt", ""),
+                  "maxTokens": max_tokens,
+                  "temperature": temperature,
+                  "topP": top_p,
+                  # "stop_sequences": stop_sequences,
+                  "countPenalty": count_penalty,
+                  "presencePenalty": presence_penalty,
+                  "frequencyPenalty": frequency_penalty
+              }
+
+              payload = {
+                  "modelId": model_id,
+                  "contentType": content_type,
+                  "accept": accept,
+                  "body": json.dumps(body)
+              }
+
+              response = bedrock.invoke_model(
+                  accept=accept,
+                  body=json.dumps(body),
+                  contentType=content_type,
+                  modelId=model_id
+              )
+
+              
+              json_response = json.loads(response['body'].read())
+
+              completion = json_response["completions"][0]["data"]["text"]
+              return completion
